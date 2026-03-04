@@ -1,7 +1,6 @@
 "use client";
 
-import algosdk from "algosdk";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 
 import NFTCard from "@/components/NFTCard";
@@ -10,159 +9,41 @@ import { Button } from "@/components/ui/button";
 import { fromMicroAlgos } from "@/lib/algorand";
 import { useToast } from "@/components/ui/use-toast";
 import { usePeraAccount } from "@/hooks/usePeraAccount";
+import { fetchAllNFTsWithFundingData, type NftData } from "@/lib/nftService";
 
-export interface NftData {
-  tokenId: number;
-  metadata: any;
-  owner: string;
-  totalDonations: bigint;
-}
-
-interface DonorStat {
-  total: bigint;
-  donations: { tokenId: number; amount: bigint; name?: string }[];
-}
+// Re-export NftData so existing imports from "@/app/page" keep working.
+export type { NftData };
 
 export default function Home() {
   const [nfts, setNfts] = useState<NftData[]>([]);
   const [hiddenTokenIds, setHiddenTokenIds] = useState<number[]>([]);
-  const [donorStats, setDonorStats] = useState<Record<string, DonorStat>>({});
   const { toast } = useToast();
   const { account } = usePeraAccount();
   const [isLoading, setIsLoading] = useState(false);
+  const fetchIdRef = useRef(0); // guards against stale closures / race conditions
 
-  useEffect(() => {
-    let cancelled = false;
-
-    if (!account) {
-      console.warn("Account null, skipping fetch");
-      setNfts([]);
-      return () => {
-        cancelled = true;
-      };
-    }
-
-    toast({
-      title: "Loading your NFTs...",
-      description: "Fetching your on-chain assets from Algorand Indexer.",
-    });
-
-    const fetchNFTs = async () => {
+  // ── 🔟 WALLET SWITCH / MOUNT: fetch via single source of truth ──
+  const loadNFTs = useCallback(
+    async (addr: string) => {
+      const id = ++fetchIdRef.current;
       setIsLoading(true);
+      console.log("[Home] loadNFTs triggered for:", addr, "fetchId:", id);
+
       try {
-        // STEP 1 — ADD NETWORK DIAGNOSTIC BLOCK
-        console.log("=== NFT FETCH DEBUG START ===");
-        console.log("Connected account:", account);
-
-        const algod = new algosdk.Algodv2("", "https://testnet-api.algonode.cloud", "");
-        const status = await algod.status().do();
-        console.log("Algod last round:", (status as any)["last-round"]);
-
-        const indexer = new algosdk.Indexer("", "https://testnet-idx.algonode.cloud", "");
-
-        // STEP 2 — LOG RAW INDEXER RESPONSE
-        const res = await indexer.lookupAccountAssets(account).do();
-        console.log("Raw indexer response:", res);
-        console.log("Total assets returned:", (res as any)?.assets?.length);
-
-        const assets = (res as any)?.assets ?? [];
-
-        // STEP 3 — REMOVE ALL FILTERS TEMPORARILY
-        const nftAssets = assets;
-        console.log("Assets BEFORE filtering:", nftAssets);
-
-        // STEP 4 — LOG EACH ASSET DETAILS
-        nftAssets.forEach((a: any) => {
-          console.log("Asset:", {
-            assetId: a?.["asset-id"] ?? a?.assetId,
-            amount: a?.amount,
-            frozen: a?.["is-frozen"] ?? a?.isFrozen,
-          });
-        });
-
-        const detailed = await Promise.all(
-          nftAssets.map(async (holding: any) => {
-            const rawAssetId = holding?.["asset-id"] ?? holding?.assetId;
-
-            // Indexer holdings may be returned as bigint in newer SDKs.
-            const assetId =
-              typeof rawAssetId === "bigint"
-                ? Number(rawAssetId)
-                : Number(rawAssetId);
-
-            console.log("Holding asset-id raw:", rawAssetId, "normalized:", assetId);
-
-            if (!Number.isFinite(assetId) || assetId <= 0) {
-              console.error(
-                "Invalid asset-id encountered (skipping holding):",
-                holding,
-                "keys:",
-                holding && typeof holding === "object" ? Object.keys(holding) : holding
-              );
-              return null;
-            }
-
-            const assetInfo = await indexer.lookupAssetByID(assetId).do();
-            // STEP 5 — LOG FULL ASSET PARAMS
-            console.log("Asset info for", holding?.["asset-id"], assetInfo);
-
-            const params = (assetInfo as any)?.asset?.params ?? {};
-
-            // STEP 11 — CHECK DECIMALS
-            if (params?.decimals !== 0) {
-              console.warn("Not an NFT (decimals != 0):", params?.decimals);
-            }
-
-            let metadata: any | null = null;
-
-            // STEP 6 — HANDLE IPFS URL NORMALIZATION
-            let url = params?.url ? String(params.url) : undefined;
-            if (url?.startsWith("ipfs://")) {
-              url = url.replace("ipfs://", "https://gateway.pinata.cloud/ipfs/");
-            }
-
-            console.log("Metadata URL:", url);
-
-            if (url) {
-              try {
-                const metaRes = await fetch(url, { cache: "no-store" });
-                console.log("Metadata response status:", metaRes.status);
-                metadata = await metaRes.json();
-              } catch (err) {
-                console.error("Metadata fetch failed:", err);
-                metadata = null;
-              }
-            }
-
-            return {
-              tokenId: assetId,
-              metadata: metadata ?? {
-                name: params?.name,
-                image: params?.url,
-              },
-              owner: account,
-              totalDonations: 0n,
-            } as NftData;
-          })
-        );
-
-        const cleanedDetailed = detailed.filter(Boolean) as NftData[];
-
-        if (cancelled) return;
-        setNfts(cleanedDetailed);
-
-        // STEP 7 — VERIFY STATE IS SET
-  console.log("Final NFT state set:", cleanedDetailed);
-
-        console.log("=== NFT FETCH DEBUG END ===");
-
+        const result = await fetchAllNFTsWithFundingData(addr);
+        if (fetchIdRef.current !== id) {
+          console.log("[Home] Stale fetch ignored (id mismatch)");
+          return;
+        }
+        setNfts(result);
+        console.log("[Home] NFT state set:", result.length, "items");
         toast({
           title: "NFTs loaded",
-          description: `Loaded ${cleanedDetailed.length} NFTs.`,
+          description: `Loaded ${result.length} NFTs with funding data.`,
         });
       } catch (e) {
-        if (cancelled) return;
-        console.error("Failed to load account NFTs", e);
+        if (fetchIdRef.current !== id) return;
+        console.error("[Home] loadNFTs failed:", e);
         toast({
           title: "Failed to load NFTs",
           description: e instanceof Error ? e.message : String(e),
@@ -170,29 +51,38 @@ export default function Home() {
         });
         setNfts([]);
       } finally {
-        if (!cancelled) setIsLoading(false);
+        if (fetchIdRef.current === id) setIsLoading(false);
       }
-    };
+    },
+    [toast]
+  );
 
-    void fetchNFTs();
+  useEffect(() => {
+    if (!account) {
+      console.warn("[Home] Account null — clearing NFTs");
+      setNfts([]);
+      return;
+    }
+    void loadNFTs(account);
+  }, [account, loadNFTs]);
 
-    return () => {
-      cancelled = true;
-    };
-  }, [account, toast]);
-
+  // ── Derived state: ALWAYS recomputed when nfts change ──
   const visibleNfts = useMemo(
     () => nfts.filter((nft) => !hiddenTokenIds.includes(nft.tokenId)),
     [nfts, hiddenTokenIds]
   );
 
+  // 3️⃣ Total depends on nfts state — NOT computed once
   const totalDonationsAll = useMemo(
     () => visibleNfts.reduce((sum, nft) => sum + (nft.totalDonations ?? 0n), 0n),
     [visibleNfts]
   );
 
   const topDonatedNfts = useMemo(
-    () => [...visibleNfts].sort((a, b) => Number(b.totalDonations) - Number(a.totalDonations)).slice(0, 10),
+    () =>
+      [...visibleNfts]
+        .sort((a, b) => Number(b.totalDonations) - Number(a.totalDonations))
+        .slice(0, 10),
     [visibleNfts]
   );
 
@@ -205,40 +95,57 @@ export default function Home() {
   }, [topDonatedNfts]);
 
   const handleDeleteNft = useCallback((tokenId: number) => {
-    setHiddenTokenIds((prev) => (prev.includes(tokenId) ? prev : [...prev, tokenId]));
+    setHiddenTokenIds((prev) =>
+      prev.includes(tokenId) ? prev : [...prev, tokenId]
+    );
   }, []);
 
-  const handleDonation = useCallback(
+  // ── 4️⃣ OPTIMISTIC UPDATE: bump funded amount instantly, then hard refetch ──
+  const handleDonationOptimistic = useCallback(
     ({ donor, amount, tokenId }: { donor: string; amount: bigint; tokenId: number }) => {
-      setDonorStats((prev) => {
-        const current = prev[donor] ?? { total: 0n, donations: [] };
-        return {
-          ...prev,
-          [donor]: {
-            total: current.total + amount,
-            donations: [...current.donations, { tokenId, amount }],
-          },
-        };
-      });
+      console.log("[Home] Optimistic update — tokenId:", tokenId, "amount:", amount.toString());
+
+      // 8️⃣ Functional update — no stale closure on `nfts`
+      // 9️⃣ State immutability — spread, never mutate
+      setNfts((prev) =>
+        prev.map((nft) =>
+          nft.tokenId === tokenId
+            ? { ...nft, totalDonations: (nft.totalDonations ?? 0n) + amount }
+            : nft
+        )
+      );
+
+      console.log("[Home] Updated Total (optimistic):", "recomputed via useMemo");
     },
     []
   );
+
+  // Called by NFTCard AFTER on-chain confirmation — hard refetch for consistency
+  const handleDonationConfirmed = useCallback(async () => {
+    if (!account) return;
+    console.log("[Home] Post-confirmation hard refetch triggered");
+    await loadNFTs(account);
+  }, [account, loadNFTs]);
 
   const isPageLoading = !!account && isLoading;
 
   return (
     <main className="container mx-auto px-4 py-10 space-y-10">
-      {/* STEP 8 — VERIFY RENDERING IS NOT BLOCKED */}
-      <pre className="text-xs opacity-70 whitespace-pre-wrap break-words">
+      {/* 🧪 DEBUG PANEL — remove after validation */}
+      <pre className="text-xs opacity-70 whitespace-pre-wrap break-words bg-muted/30 rounded p-2">
         Account: {String(account)}
         {"\n"}NFT Count: {nfts.length}
+        {"\n"}Total Fan Funds: {fromMicroAlgos(totalDonationsAll)} ALGO
       </pre>
 
       <section className="flex flex-col gap-6 md:flex-row md:items-center md:justify-between">
         <div>
-          <h1 className="text-4xl md:text-5xl font-bold tracking-tight mb-3">Explore impact NFTs</h1>
+          <h1 className="text-4xl md:text-5xl font-bold tracking-tight mb-3">
+            Explore impact NFTs
+          </h1>
           <p className="text-muted-foreground max-w-xl text-sm md:text-base">
-            Discover NFTs, support creators, and track the most supported drops in the community.
+            Discover NFTs, support creators, and track the most supported drops
+            in the community.
           </p>
         </div>
 
@@ -249,11 +156,15 @@ export default function Home() {
           </div>
           <div className="rounded-xl border bg-card dark:bg-gradient-to-br dark:from-slate-900/60 dark:to-emerald-900/40 px-4 py-3">
             <p className="text-xs text-muted-foreground">Total fan donations</p>
-            <p className="text-lg font-semibold">{fromMicroAlgos(totalDonationsAll)} ALGO</p>
+            <p className="text-lg font-semibold">
+              {fromMicroAlgos(totalDonationsAll)} ALGO
+            </p>
           </div>
           <div className="rounded-xl border bg-card dark:bg-gradient-to-br dark:from-slate-900/60 dark:to-indigo-900/40 px-4 py-3">
             <p className="text-xs text-muted-foreground">Top supported</p>
-            <p className="text-sm font-semibold truncate">{topSupportedNames}</p>
+            <p className="text-sm font-semibold truncate">
+              {topSupportedNames}
+            </p>
           </div>
         </div>
       </section>
@@ -275,14 +186,21 @@ export default function Home() {
         ) : visibleNfts.length > 0 ? (
           <div className="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
             {visibleNfts.map((nft) => (
-              <NFTCard key={nft.tokenId} nft={nft} onDelete={handleDeleteNft} onDonation={handleDonation} />
+              <NFTCard
+                key={nft.tokenId}
+                nft={nft}
+                onDelete={handleDeleteNft}
+                onDonation={handleDonationOptimistic}
+                onTotalsChange={handleDonationConfirmed}
+              />
             ))}
           </div>
         ) : (
           <div className="rounded-xl border bg-card p-10 text-center">
             <h3 className="text-lg font-semibold">No NFTs yet</h3>
             <p className="text-muted-foreground text-sm mt-2">
-              Be the first to mint an impact NFT and start building your fan funding journey.
+              Be the first to mint an impact NFT and start building your fan
+              funding journey.
             </p>
             <Button className="mt-6" asChild>
               <Link href="/mint">Mint your first NFT</Link>
